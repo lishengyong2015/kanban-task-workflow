@@ -725,3 +725,4 @@ hermes kanban show <task_id>          # 看详情
 ## 参考文档
 
 - `references/task-number-format.md` — T编号映射文件（`~/.hermes/kanban_task_numbers.txt`）的格式说明与读写命令
+- `references/publish-to-github.md` — 将 Hermes 技能发布到 GitHub 仓库的 API 上传工作流（git push 超时时的备选方案）
