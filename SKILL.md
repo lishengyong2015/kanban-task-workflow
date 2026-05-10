@@ -1,8 +1,9 @@
 ---
 name: kanban-task-workflow
 description: 通用看板任务执行工作流——Research → Plan → Code → Build → Complete，每阶段有用户确认点。适用于任何看板开发任务。用户发起看板开发时加载此技能。
-version: 1.1.0
+version: 1.3.0
 created: 2026-05-10
+updated: 2026-05-11
 tags: [kanban, workflow, multi-agent, development]
 ---
 
@@ -78,6 +79,7 @@ kanban worker 是**后台自主运行**的，没有人类在终端前等它。
    - 备份文件供 worker 后续阶段参考（worker 可以看到旧的方案/代码分析）
    - 示例：退回 Phase 2 时 → `mv implementation-plan.md implementation-plan.md.old`
    - 退回 Phase 3 时 → 保留 research-findings.md 和 implementation-plan.md，删除 build-result.md（备份为 .old）
+   - 退回 Phase 1 时（从 Phase 4+ 深层退回）→ 所有阶段文件（implementation-plan.md、code-review-result.md、build-result.md 等）全部备份为 .old，只留 TASK.md
 
 4. 创建 `TASK.md` — 写入 workspace 目录：
    - 从 task body 中提取 `notify_target: <平台>:<chat_id>`（如 `feishu:oc_xxx`）
@@ -589,8 +591,28 @@ echo "T${next} (${task_id}) 已创建，指派给 <worker>"
 创建任务时，主对话 AI 自动执行：
 1. **分配 T 编号** — 从映射文件读取下一个编号
 2. **提取 notify_target** — 从当前对话自动获取 platform:chat_id，写入 body
-3. **通知用户** — 创建完成后告诉用户"T${next} 已创建"
-4. **订阅通知** — 立即 subscribe 到当前对话平台
+3. **评估任务规模** — 如果 scope 涉及 5+ 个文件的修改或编码量较大，创建时加上 `--max-runtime 30m`（或更长），避免默认 15 分钟超时中断
+4. **通知用户** — 创建完成后告诉用户"T${next} 已创建"
+5. **订阅通知** — 立即 subscribe 到当前对话平台
+
+### 主对话 AI 处理用户退回指令
+
+当用户说"驳回到 X 阶段"（而不是 worker 自动退回）时，主对话 AI 需手动执行：
+
+1. **写 comment** — 记录退回原因和用户意见到任务
+2. **unblock** — 如果任务处于 blocked 状态，先 unblock
+3. **更新 TASK.md** — 手动改 current_phase 为目标阶段、retreat_count += 1、加 retreat_reason 字段
+4. **备份中间产物** — 将 workspace 中的阶段文件（implementation-plan.md、build-result.md、code-review-result.md 等）重命名为 `.old`，让 worker 下一轮从零开始
+
+```bash
+cd ~/.hermes/kanban/workspaces/${task_id}/
+mv implementation-plan.md implementation-plan.md.old
+mv build-result.md build-result.md.old
+mv code-review-result.md code-review-result.md.old
+# ... 其他阶段文件同理
+```
+
+注意：如果是 worker 自己检测 comment 后自动退回，worker 内部会执行备份和 TASK.md 更新，主对话 AI 不需要介入。只有当**用户直接在对话中说"驳回到X阶段"**时才需要手动处理。
 
 ### 你只需要说
 
@@ -621,6 +643,8 @@ T3 方案不通过，修改意见：重新设计拦截位置
 ```
 
 然后 unblock → worker 自动检测 comment、退回对应阶段重做。旧产物备份为 .old 供参考。
+
+**注意：worker 自动退回只适用于 Phase 1~3 之间的循环退回。如果用户在对话中要求"驳回到第一阶段"而任务已到 Phase 4（编译完成），worker 检测不到 comment（因为 block 在邮箱确认阶段，worker 不会自动调度）。此时需要主对话 AI 手动处理**（见上方「主对话 AI 处理用户退回指令」）。
 
 ### 附：支持的 comment 关键词
 
@@ -663,14 +687,70 @@ T3 方案不通过，修改意见：重新设计拦截位置
 - **看板状态机只有 6 种状态**（todo/ready/running/blocked/done/archived），不支持 "researching"、"coding" 等自定义阶段状态。本技能通过 workspace 中的中间产物文件（research-findings.md 等）模拟阶段感，底层看板始终只看到 blocked ↔ running ↔ done。**返工循环**（Code Review → Code）通过 unblock 后续跑检测实现，不是真正的状态回退。
 - **用户确认点依赖 kanban_block/unblock 机制**：blocked 状态下 worker 进程退出，unblock 后 dispatcher 重新 spawn worker。续跑检测（检查已有的阶段文件）确保不重复劳动。
 
+## Worker 运行时配置
+
+### 默认超时
+
+Worker 的默认运行超时约为 15 分钟（903s），超时后 dispatcher SIGTERM（再 SIGKILL）worker 并重新调度。重跑时通过续跑检测恢复上下文。
+
+### 调大超时
+
+**两种方式**：
+
+1. **创建任务时指定**（推荐，针对大任务）：
+   ```bash
+   hermes kanban create "标题" \
+     --assignee worker-1 \
+     --max-runtime 30m    # 支持: 90s, 30m, 2h, 1d
+   ```
+
+2. **全局设置**（影响所有新调度任务，不影响已创建任务）：
+   ```bash
+   hermes config set kanban.max_runtime 30m
+   ```
+   ⚠️ 注意：该全局设置在已创建的运行中任务上不生效。如果任务已创建但还没开始跑，需要先 `hermes kanban archive` 再重建。
+
+### 超时影响
+
+- 代码修改已写入物理文件（持久化），不会丢失
+- 重跑时 worker 读取 workspace 中间产物（TASK.md、implementation-plan.md）进行续跑
+- **续跑时必须检查源文件 mtime**：前一轮可能已修改部分代码但没来得及记录完成状态。用 `stat --format='%y'` 检查文件时间戳，对照 implementation-plan.md 中的改动清单，逐文件确认是否已修改
+- 每次重跑都会浪费约 5-10 分钟的热身时间（重新理解上下文、检查已改文件）
+- **大任务推荐直接拆成多个子任务**，而非依赖调大超时
+
+### ⚠️ 已知限制：`--max-runtime` 可能不生效
+
+**关键踩坑（2026-05-10 实测）**：即使任务创建时显式传了 `--max-runtime 30m`，worker 仍然在 903 秒（约 15 分钟）被 reclaim。可能原因：
+- `--max-runtime` 对 `reclaim` 超时（stale_lock detection）无影响，只影响 dispatch 阶段的调度超时
+- 或者该版本不支持 per-task max-runtime 覆盖
+
+**应对策略**：
+- 如果 15 分钟不够，不要依赖 `--max-runtime` 延长时间
+- 而是**拆任务**：把大任务拆成多个子任务，每个子任务控制在 15 分钟内可完成（如逐文件拆分、逐模块拆分）
+- 或者走归档+重建流程（见下方「重创任务流程」）
+
 ---
 
 ## 故障恢复
 
-### worker 中途被中断（gateway 重启/dispatcher 重调度）
+### worker 中途被中断（timeout/reclaim/重调度）
 1. 检查 workspace 中已有哪些阶段文件
 2. 从缺失的阶段续跑，不重复已完成的阶段
-3. 已完成阶段对应的 block 如果已被 unblock，直接进入下一阶段
+3. **关键**：对于 Code 阶段被中断的情况，还要检查**项目源文件的修改时间戳**（`stat --format='%y' <files>`），因为前一轮可能已经改了一部分代码但没来得及记录完成状态。对照 implementation-plan.md 中的改动清单，逐文件确认是否已修改，避免重复或遗漏。
+4. ⚠️ 默认 worker 运行超时约 15 分钟（903 秒）。如果 coding 任务涉及 5+ 个文件的大改动，考虑：
+   - 拆分成多个子任务（逐文件/逐模块拆分），每任务控制在 15 分钟可完成
+   - 或者跟创建者沟通是否需要放宽超时限制
+5. **重创任务流程（当调大超时仍不够，或需要重建上下文时）**：
+   - `hermes kanban archive <task_id>` — 归档当前任务（代码修改已写入磁盘，不受影响）
+   - 创建新任务时加 `--max-runtime 30m`（或更长）
+   - **复制旧工作区文件到新工作区**，让新 worker 可以续跑：
+     ```bash
+     cp ~/.hermes/kanban/workspaces/<old_id>/implementation-plan.md \
+        ~/.hermes/kanban/workspaces/<new_id>/
+     ```
+   - 如果 Research 阶段产物（research-findings.md）也有价值，一并复制
+   - 注意：TASK.md 会被新 worker 自动重新生成，无需复制
+6. 已完成阶段对应的 block 如果已被 unblock，直接进入下一阶段
 
 ### 编译失败
 1. 记录完整编译日志到 workspace
@@ -696,29 +776,120 @@ T3 方案不通过，修改意见：重新设计拦截位置
 
 ---
 
-## 关键陷阱：通知不可靠（WeChat 静默丢消息 + 订阅自动清除）
+## 通知机制：send_message vs notify-subscribe
 
-**问题**：看板通知**经常无法到达用户**。表现为：
+### 两条通知路径
+
+看板任务的状态通知走**两条独立路径**：
+
+| 路径 | 发送方 | 机制 | 可靠性 |
+|------|--------|------|--------|
+| Worker 内部 send_message | Kanban worker（子智能体） | 在 Phase 出口调用 `send_message` 工具向 notify_target 发消息 | **✅ 可用** — detached worker 无 origin 时需配显式 target |
+| kanban notify-subscribe | Gateway 通知器（dispatcher） | 任务状态变化时自动推送到订阅的平台 | **❌ 不可靠** — WeChat 限流/静默丢消息 |
+
+### 路径一：Worker 的 send_message 可用（需注意 detached 场景）
+
+技能在每个阶段的出口都要求 worker 执行 `send_message` 通知创建者。现在 **kanban worker 的工具集中已加入 `send_message` 工具**，可以直接调用。
+
+**注意事项**：
+- `target="origin"` 发回到触发该任务的对话。对于 detached/scheduled worker（无 active conversation context），origin 不存在，消息发不出去。此时需要在 TASK.md `notify_target` 中指定显式平台（如 `telegram` 或 `feishu`），worker 用 `send_message(target=notify_target, message=...)`。
+- 即使 send_message 可用，**邮件仍是 worker 最可靠的外部通知通道**（不依赖任何对话上下文）。
+- 发完通知后应配合 `kanban_comment` 留底，方便追溯。
+- `send_message` 不能替代 `kanban_complete`，任务完成必须调 complete。
+
+**工作流修正**：各阶段出口中的 "STEP 3 发送通知给创建者" 现在 worker 可以实际执行。但考虑到 detached 场景可能需要显式 target，建议 worker 从 TASK.md 读取 `notify_target`，如果值是 "origin" 但无 active origin，改用邮件通知作为保底。
+
+### 路径二：notify-subscribe 被自动清除（二次失效）
+
+整体流程见下方"微信/飞书通知可靠性"章节。  
+
+## 关键陷阱二：Worker 默认运行超时（15分钟限制）
+
+Worker 的默认运行超时约为 **15 分钟（903 秒）**，超时后 dispatcher SIGTERM → SIGKILL 并重新调度。这是一个高频踩坑点。
+
+### 调大超时的尝试与结果
+
+**两种方式**：
+
+1. **创建任务时指定 `--max-runtime`**：
+   ```bash
+   hermes kanban create "标题" --assignee worker-1 --max-runtime 30m
+   ```
+   支持格式：`90s`, `30m`, `2h`, `1d`
+
+2. **全局设置**（影响新调度的任务）：
+   ```bash
+   hermes config set kanban.max_runtime 30m
+   ```
+
+**⚠️ 踩坑（2026-05-10 实测）**：即使设置了 `--max-runtime 30m`，worker 仍然在 903 秒被 reclaim。说明 per-task `--max-runtime` 在 reclaim 阶段未生效，可能只影响调度的超时阈值，不影响 stale_lock 检测的 15 分钟硬限制。
+
+**应对策略**：
+- **不要依赖调大超时**来解决复杂长任务
+- **拆任务**：大任务拆成多个子任务，每个控制在 15 分钟内可完成（如逐文件拆分、逐模块拆分）
+- 如果必须重建：归档旧任务 → 创建新任务（带 `--max-runtime`）→ 复制旧 workspace 的 implementation-plan.md 到新 workspace → 新 worker 续跑
+
+### 超时后的续跑检测
+
+当 worker 被中断后重跑时，**不能只看 workspace 中的阶段文件**，因为代码可能已经修改了源文件但没来得及更新 workspace：
+
+```bash
+# 检查源文件修改时间，推断编码进度
+stat --format='%y %n' /path/to/modified/files/*.cpp /path/to/modified/files/*.h | sort -k2
+# 对照 implementation-plan.md 中的改动清单，逐文件确认是否已修改
+```
+
+文件修改时间在 15 分钟窗口内的，说明前一轮已改过或部分改过。重跑时不再重复修改，而是检查完整性后继续。
+
+## 微信/飞书通知可靠性（完整分析）
+
+### 问题表现
+
+看板通知**经常无法到达用户**。表现为：
 - 创建任务后从未收到任何通知
 - `hermes kanban notify-list` 返回空
-  
-**两个独立原因**：
+
+### 完整失效链路（多路径分析）
+
+看板任务的状态通知走**两条路径**，send_message 可用后通知可靠性显著提升：
+
+| 路径 | 发送方 | 机制 | 当前状态 |
+|------|--------|------|---------|
+| Worker 内 `send_message` | Kanban worker | 在 Phase 出口调用 `send_message` 工具向 notify_target 发消息 | **可用**（v2.1.0），detached worker 需用显式 target |
+| `notify-subscribe` 自动通知 | Gateway 通知器 | 任务状态变化时推送到订阅平台 | 微信限流 3 次后自动删除订阅，**不靠谱** |
+
+### 两个独立原因
 
 1. **订阅被自动清除** — WeChat iLink API rate limit 导致通知器连续 3 次发送失败后，自动删除该任务的订阅。这是最可能的原因（见上方「通知订阅机制」的订阅生命周期）。
 2. **消息被微信静默丢弃** — 即使订阅还在，网关和用户对话频繁时，block 通知会被微信静默丢弃——不报错、不返回错误码。kanban 通知器的 `adapter.send()` 返回成功，但消息从未到达用户。
 
-**最佳应对**：
+### 最佳应对
 
 当用户问"任务怎么样了？没有收到通知"：
-1. `hermes kanban notify-list` — 检查订阅是否存在
-2. 如果空 → 重新 subscribe 到当前对话平台
-3. 直接查任务状态回复用户，不要依赖重新订阅后的通知来工作
 
-```bash
-hermes kanban list --status blocked   # 看谁在等你
-hermes kanban list --status running   # 看谁在跑
-hermes kanban show <task_id>          # 看详情
-```
+1. `hermes kanban notify-list` — 检查订阅是否存在
+2. 如果空 → 重新 subscribe 到当前对话平台（但仍可能再被限流删除）
+3. **最可靠方式**：直接查任务状态回复用户：
+   ```bash
+   hermes kanban list --status blocked   # 看谁在等你
+   hermes kanban list --status running   # 看谁在跑
+   hermes kanban show <task_id>          # 看详情
+   ```
+4. 如果还需要知道更多细节，检查 workspace 中间产物：
+   ```bash
+   ls ~/.hermes/kanban/workspaces/<task_id>/
+   ```
+   以及项目源文件修改时间：
+   ```bash
+   stat --format='%y %n' /path/to/scope/files  | sort
+   ```
+
+### 策略建议：send_message 首选，notify-subscribe 备用
+
+- **首选**：worker 直接用 `send_message` 发通知给创建者（detached 场景配显式 target）
+- **备用**：邮件发给李总（最可靠，不依赖对话上下文）
+- **不推荐**：依赖 notify-subscribe 自动推送（微信不可靠）
+- **兜底**：主对话 AI 定期轮询看板状态，主动告知用户
 
 ---
 
@@ -726,3 +897,4 @@ hermes kanban show <task_id>          # 看详情
 
 - `references/task-number-format.md` — T编号映射文件（`~/.hermes/kanban_task_numbers.txt`）的格式说明与读写命令
 - `references/publish-to-github.md` — 将 Hermes 技能发布到 GitHub 仓库的 API 上传工作流（git push 超时时的备选方案）
+- `references/t7-notification-failure-case.md` — 2026-05-10 完整案例复盘：T7 任务从创建→5次调度→退回→重新编码→完成的完整过程，含通知双路径失效分析、--max-runtime 失效、退回到第一阶段的手动操作等关键教训
