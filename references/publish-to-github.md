@@ -2,6 +2,37 @@
 
 When `git push` times out or is unavailable, use the GitHub API to create a repo and upload files directly.
 
+## Pre-sync Verification: Diff Local vs Published
+
+Before publishing changes, verify that local modifications are all intentional by diffing against the live GitHub version:
+
+### Step 1 — Fetch GitHub version
+
+```bash
+curl -s "https://raw.githubusercontent.com/<owner>/<repo>/main/SKILL.md" > /tmp/github_skill.md
+curl -s "https://raw.githubusercontent.com/<owner>/<repo>/main/references/<file>.md" > /tmp/github_ref.md
+```
+
+### Step 2 — Diff local vs GitHub
+
+```bash
+diff /tmp/github_skill.md /path/to/local/SKILL.md
+```
+
+### Step 3 — Verify each diff line
+
+Check against a known change list. For each diff hunk, confirm:
+- Is it a version bump or feature change you intentionally made?
+- Is it a path normalization (`~` → `/home/user/`)?
+- Is it an expected backward-compat addition?
+- **Any unexpected diff is a red flag** — investigate before publishing.
+
+### Step 4 — Check reference files too
+
+If local reference files (`references/*`) were added or modified, check whether they exist on GitHub (some are local-only sensitive files that should NOT be published). The `sync-kanban-skill` script auto-excludes the local sensitive versions, but manual verification is safer.
+
+---
+
 ## Workflow
 
 ### 1. Create Repo via API
@@ -44,10 +75,10 @@ for root, dirs, fnames in os.walk(base):
         with open(path, "rb") as fh:
             content = fh.read()
         encoded = base64.b64encode(content).decode()
-        cmd = f'''curl -s -X PUT \\
-          -H "Authorization: token {token}" \\
-          -H "Accept: application/vnd.github.v3+json" \\
-          "https://api.github.com/repos/{repo}/contents/{rel}" \\
+        cmd = f'''curl -s -X PUT \\\
+          -H "Authorization: token {token}" \\\
+          -H "Accept: application/vnd.github.v3+json" \\\
+          "https://api.github.com/repos/{repo}/contents/{rel}" \\\
           -d '{{
             "message": "Add {rel}",
             "content": "{encoded}",
@@ -79,4 +110,5 @@ git push -u origin main
 - **File already exists**: PUT /contents/ will reject if file exists without a `sha`. Delete first, or use a different branch
 - **Binary files**: base64 encode. The API content field expects base64
 - **Rate limits**: 5000 req/hr authenticated. One file per request, not a problem for small skills
-- **Git timout in WSL**: HTTPS git push from WSL often stalls. The API approach is more reliable
+- **Git timeout in WSL**: HTTPS git push from WSL often stalls. The API approach is more reliable
+- **Sensitive files in references/**: `architecture-decisions.md` contains private contact info and local paths accessible ONLY to this Hermes instance. Do NOT publish it to GitHub. The `sync-kanban-skill` script handles this automatically (it uses a separate public-only repo), but manual git push will expose sensitive data.
